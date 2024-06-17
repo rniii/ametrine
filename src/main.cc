@@ -10,6 +10,11 @@ const QString OS_NAME = "osx";
 #else
 const QString OS_NAME = "unknown";
 #endif
+#ifdef Q_PROCESSOR_X86_32
+const QString OS_ARCH = "x86";
+#else
+const QString OS_ARCH = "unknown";
+#endif
 
 const QString USERNAME = "joebiden";
 const QString PISTON_URL =
@@ -23,6 +28,25 @@ QDir getDataDirectory() {
 
 QDir getCacheDirectory() {
   return QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+}
+
+bool checkRules(QJsonValue rules) {
+  if (!rules.isArray())
+    return true;
+
+  for (QJsonValue rule : rules.toArray()) {
+    auto os = rule["os"];
+    bool match = !os["name"].isUndefined()   ? os["name"] == OS_NAME
+                 : !os["arch"].isUndefined() ? os["arch"] == OS_ARCH
+                                             : false;
+
+    if ((rule["action"] == "allow" && !match) ||
+        (rule["action"] == "disallow" && match)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 class VersionManifest {
@@ -64,16 +88,10 @@ public:
     info.clientJar = data["downloads"]["client"]["url"].toString();
     info.jvmVersion = data["javaVersion"]["majorVersion"].toInt();
     for (QJsonValue lib : data["libraries"].toArray()) {
-      if (auto rules = lib["rules"]; rules.isArray()) {
-        for (QJsonValue rule : rules.toArray()) {
-          if ((rule["action"] == "allow" && rule["os"]["name"] != OS_NAME) ||
-              (rule["action"] == "disallow" && rule["os"]["name"] == OS_NAME)) {
-            goto end;
-          }
-        }
-      }
+      if (!checkRules(lib["rules"]))
+        continue;
+
       info.libraries << lib["downloads"]["artifact"]["path"].toString();
-    end:;
     }
 
     return info;
@@ -83,10 +101,9 @@ public:
 class VersionManager : QObject {
 public:
   explicit VersionManager();
-  void launchVersion(const VersionInfo &version);
   VersionManifest fetchManifest();
   VersionInfo fetchVersion(const VersionManifest &manifest, const QString &id);
-  QJsonObject fetchAssets(const VersionInfo &version);
+  QJsonDocument fetchAssets(const VersionInfo &version);
 
 private:
   QJsonDocument fetchJson(const QNetworkRequest &req);
@@ -104,65 +121,6 @@ VersionManager::VersionManager() {
   client->setCache(cache);
 }
 
-void VersionManager::launchVersion(const VersionInfo &version) {
-  auto directory = getDataDirectory();
-  auto assets = directory.filePath("assets");
-  auto libraries = directory.filePath("libraries");
-  auto gameDir = directory.filePath("instances/" + version.id + "/minecraft");
-  auto client =
-      directory.filePath("versions/" + version.id + "/" + version.id + ".jar");
-  auto natives = getCacheDirectory().filePath("natives");
-  // QDir(natives).mkpath(".");
-
-  QString classpath;
-  for (auto lib : version.libraries) {
-    classpath += libraries + lib;
-    classpath += QDir::listSeparator();
-  }
-  classpath += client;
-
-  QString jvm = "/usr/lib/jvm/java-21-openjdk/bin/java";
-  QStringList args = {};
-
-  // -- JVM args --
-#ifdef Q_OS_MACOS
-  args << "-XstartOnFirstThread";
-#endif
-#ifdef Q_OS_WIN
-  args << "-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_"
-          "minecraft.exe.heapdump";
-#endif
-#ifdef Q_PROCESSOR_X86_32
-  args << "-Xss1M";
-#endif
-  args << "-Djava.library.path=" + natives;
-  args << "-Djna.tmpdir=" + natives;
-  args << "-Dorg.lwjgl.system.SharedLibraryExtractPath=" + natives;
-  args << "-Dio.netty.native.workdir=" + natives;
-  args << "-Dminecraft.launcher.brand=Ametrine";
-  args << "-Dminecraft.launcher.version=0.1.0";
-  // args << "-Dlog4j.configurationFile=${path}";
-  args << "-cp" << classpath;
-  args << version.mainClass;
-
-  // -- game args --
-  args << "--username" << USERNAME;
-  args << "--version" << version.id;
-  args << "--gameDir" << gameDir;
-  args << "--assetsDir" << assets;
-  args << "--assetIndex" << version.assets;
-  // authorize my balls
-  // args << "--uuid" << "...";
-  // args << "--accessToken" << "...";
-  // args << "--clientId" << "...";
-  // args << "--xuid" << "...";
-  // args << "--userType" << "...";
-  args << "--versionType" << version.type;
-
-  auto game = new QProcess(this);
-  game->start(jvm, args);
-}
-
 VersionManifest VersionManager::fetchManifest() {
   return VersionManifest::fromJson(fetchJson(PISTON_URL));
 }
@@ -175,11 +133,11 @@ VersionInfo VersionManager::fetchVersion(const VersionManifest &manifest,
   return VersionInfo::fromJson(id, fetchJson(request));
 }
 
-QJsonObject VersionManager::fetchAssets(const VersionInfo &version) {
+QJsonDocument VersionManager::fetchAssets(const VersionInfo &version) {
   auto request = QNetworkRequest(version.assetIndex);
   request.setAttribute(QNetworkRequest::CacheLoadControlAttribute,
                        QNetworkRequest::PreferCache);
-  return fetchJson(request)["objects"].toObject();
+  return fetchJson(request);
 }
 
 QJsonDocument VersionManager::fetchJson(const QNetworkRequest &req) {
@@ -197,17 +155,20 @@ QJsonDocument VersionManager::fetchJson(const QUrl &url) {
 
 class Launcher : QObject {
 public:
-  Launcher(const VersionInfo &version, const QJsonObject &assets);
+  Launcher(const VersionInfo &version, const QJsonDocument &assets);
   void launchGame();
 
 private:
   void downloadFiles();
   void downloadAsset(const QString &url, const QString &path);
+  void jvmArgs();
+  void gameArgs();
 
   VersionInfo version;
-  QJsonObject assets;
+  QJsonDocument assets;
   QMap<QNetworkReply *, QString> pending;
   QNetworkAccessManager *client;
+  QStringList args;
 
   QDir dataDir;
   QString assetsDir;
@@ -217,7 +178,7 @@ private:
   QString nativesDir;
 };
 
-Launcher::Launcher(const VersionInfo &version, const QJsonObject &assets)
+Launcher::Launcher(const VersionInfo &version, const QJsonDocument &assets)
     : version(version), assets(assets) {
   dataDir = getDataDirectory();
   assetsDir = dataDir.filePath("assets");
@@ -228,10 +189,19 @@ Launcher::Launcher(const VersionInfo &version, const QJsonObject &assets)
 }
 
 void Launcher::launchGame() {
-  downloadFiles();
-
   QDir(nativesDir).mkpath(".");
 
+  downloadFiles();
+
+  jvmArgs();
+  gameArgs();
+
+  auto game = new QProcess;
+  game->setProcessChannelMode(QProcess::ForwardedChannels);
+  game->start("/usr/lib/jvm/java-21-openjdk/bin/java", args);
+}
+
+void Launcher::jvmArgs() {
   QString classpath;
   for (auto lib : version.libraries) {
     classpath += librariesDir + "/" + lib;
@@ -239,10 +209,6 @@ void Launcher::launchGame() {
   }
   classpath += versionDir + "/client.jar";
 
-  QString jvm = "/usr/lib/jvm/java-21-openjdk/bin/java";
-  QStringList args = {};
-
-  // -- JVM args --
 #ifdef Q_OS_MACOS
   args << "-XstartOnFirstThread";
 #endif
@@ -262,24 +228,17 @@ void Launcher::launchGame() {
   // args << "-Dlog4j.configurationFile=${path}";
   args << "-cp" << classpath;
   args << version.mainClass;
+}
 
-  // -- game args --
+void Launcher::gameArgs() {
   args << "--username" << USERNAME;
   args << "--version" << version.id;
   args << "--gameDir" << gameDir;
   args << "--assetsDir" << assetsDir;
   args << "--assetIndex" << version.assets;
-  // authorize my balls
-  // args << "--uuid" << "...";
-  args << "--accessToken" << "";
-  // args << "--clientId" << "...";
-  // args << "--xuid" << "...";
-  // args << "--userType" << "...";
+  args << "--accessToken"
+       << "";
   args << "--versionType" << version.type;
-
-  auto game = new QProcess;
-  game->setProcessChannelMode(QProcess::ForwardedChannels);
-  game->start(jvm, args);
 }
 
 void Launcher::downloadFiles() {
@@ -303,13 +262,21 @@ void Launcher::downloadFiles() {
     downloadAsset(LIBRARIES_ENDPOINT + lib, librariesDir + "/" + lib);
   }
 
-  for (auto obj = assets.constBegin(); obj != assets.constEnd(); obj++) {
+  auto objects = assets["objects"].toObject();
+  for (auto obj = objects.constBegin(); obj != objects.constEnd(); obj++) {
     auto hash = obj.value()["hash"].toString();
     auto entry = hash.left(2) + "/" + hash;
     downloadAsset(RESOURCES_ENDPOINT + entry, assetsDir + "/objects/" + entry);
   }
 
-  downloadAsset(version.clientJar,versionDir+"/client.jar");
+  downloadAsset(version.clientJar, versionDir + "/client.jar");
+
+  QFile index(assetsDir + "/indexes/" + version.assets + ".json");
+  QFileInfo(index).dir().mkpath(".");
+
+  index.open(QIODevice::WriteOnly);
+  index.write(assets.toJson(QJsonDocument::Compact));
+  index.close();
 }
 
 void Launcher::downloadAsset(const QString &url, const QString &path) {
